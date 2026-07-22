@@ -27,7 +27,7 @@ class AirQualityDash:
         self.root = tk.Tk()
         self.root.title("Big Data Processing Engine - Storm Topology Interface")
         self.root.configure(bg="#121212")
-        self.root.geometry("780x590")
+        self.root.geometry("780x490")
         self.root.resizable(False, False)
 
         tk.Label(
@@ -107,7 +107,7 @@ class AirQualityDash:
         self.b_slider = tk.Scale(
             control_frame,
             from_=1,
-            to=10,
+            to=4,
             orient=tk.HORIZONTAL,
             variable=self.b_win_var,
             bg="#1E1E1E",
@@ -133,7 +133,7 @@ class AirQualityDash:
         self.g_slider = tk.Scale(
             control_frame,
             from_=1,
-            to=10,
+            to=4,
             orient=tk.HORIZONTAL,
             variable=self.g_win_var,
             bg="#1E1E1E",
@@ -198,7 +198,7 @@ class AirQualityDash:
             font=("Segoe UI", 11, "bold"),
             height=2
         )
-        self.alarm_bar.place(x=30, y=495, width=720)
+        self.alarm_bar.place(x=30, y=395, width=720)
 
     def _push_controls(self):
         try:
@@ -477,81 +477,116 @@ def format_window(window):
 
 
 class FuzzyJoinBolt:
-    def __init__(self, input_stream_1, input_stream_2, output_stream, shared_controls):
+    def __init__(
+        self,
+        input_stream_1,
+        input_stream_2,
+        output_stream,
+        shared_controls
+    ):
         self.input_stream_1 = input_stream_1
         self.input_stream_2 = input_stream_2
         self.output_stream = output_stream
-
-        # @@@ This is the shared dynamic control dictionary.
-        # @@@ The GUI changes it; the bolt reads from it continuously.
         self.controls = shared_controls
 
         self.berlin_window = []
         self.goettingen_window = []
 
-    def run(self):
-        t1 = self.input_stream_1.get()
-        t2 = self.input_stream_2.get()
+        # Prevent the same Berlin–Goettingen pair being emitted twice.
+        self.emitted_pairs = set()
 
+    def _trim_windows(self):
+        """Apply the current window sizes selected in the GUI."""
+
+        while len(self.berlin_window) > self.controls["berlin_win_size"]:
+            self.berlin_window.pop(0)
+
+        while len(self.goettingen_window) > self.controls["goettingen_win_size"]:
+            self.goettingen_window.pop(0)
+
+    def _try_join(self, berlin_tuple, goettingen_tuple):
+        """
+        Join two records when their timestamp difference is
+        within the selected fuzzy tolerance.
+        """
+
+        ts1, city1, pm10_1, pm25_1 = berlin_tuple
+        ts2, city2, pm10_2, pm25_2 = goettingen_tuple
+
+        time_difference = abs((ts1 - ts2).total_seconds()) / 60
+
+        if time_difference > self.controls["tolerance_minutes"]:
+            return
+
+        # Avoid emitting the same pair twice.
+        pair_key = (ts1, ts2)
+
+        if pair_key in self.emitted_pairs:
+            return
+
+        self.emitted_pairs.add(pair_key)
+
+        pm10_difference = abs(pm10_1 - pm10_2)
+
+        output_tuple = (
+            ts1,
+            ts2,
+            pm10_1,
+            pm10_2,
+            time_difference,
+            pm10_difference,
+            pm25_1,
+            pm25_2,
+            format_window(self.berlin_window),
+            format_window(self.goettingen_window)
+        )
+
+        self.output_stream.put(output_tuple)
+
+    def run(self):
         while True:
-            if t1[0] == "END" or t2[0] == "END":
-                self.output_stream.put(("END", None, None, None, None, None, None, None, None, None))
+            # Read the next tuple from both streams.
+            berlin_tuple = self.input_stream_1.get()
+            goettingen_tuple = self.input_stream_2.get()
+
+            if (
+                berlin_tuple[0] == "END"
+                or goettingen_tuple[0] == "END"
+            ):
+                self.output_stream.put(
+                    (
+                        "END",
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                        None
+                    )
+                )
                 break
 
-            ts1, city1, pm10_1, pm25_1 = t1
-            ts2, city2, pm10_2, pm25_2 = t2
+            # Add the new tuples to their windows.
+            self.berlin_window.append(berlin_tuple)
+            self.goettingen_window.append(goettingen_tuple)
 
-            # @@@ New tuples enter their own sliding windows.
-            self.berlin_window.append(t1)
-            self.goettingen_window.append(t2)
+            # Remove old tuples according to the GUI settings.
+            self._trim_windows()
 
-            # @@@ Dynamic Berlin window size.
-            # @@@ If the GUI slider says Berlin size = 4, keep only 4.
-            # @@@ If the slider changes to 7, keep 7.
-            while len(self.berlin_window) > self.controls["berlin_win_size"]:
-                self.berlin_window.pop(0)
+            # Compare the new Berlin tuple with every Goettingen
+            # tuple currently available in its window.
+            for g_tuple in self.goettingen_window:
+                self._try_join(berlin_tuple, g_tuple)
 
-            # @@@ Dynamic Goettingen window size.
-            # @@@ This can be different from Berlin's window size.
-            while len(self.goettingen_window) > self.controls["goettingen_win_size"]:
-                self.goettingen_window.pop(0)
-
-            # @@@ Time distance between the two stream tuples.
-            time_difference = abs((ts1 - ts2).total_seconds()) / 60
-
-            # @@@ Dynamic fuzzy join tolerance.
-            # @@@ If time_difference <= tolerance, the tuples are joined.
-            if time_difference <= self.controls["tolerance_minutes"]:
-                pm10_difference = abs(pm10_1 - pm10_2)
-
-                output_tuple = (
-                    ts1,
-                    ts2,
-                    pm10_1,
-                    pm10_2,
-                    time_difference,
-                    pm10_difference,
-                    pm25_1,
-                    pm25_2,
-                    format_window(self.berlin_window),
-                    format_window(self.goettingen_window)
-                )
-
-                # @@@ Storm-style emit from bolt to sink stream.
-                self.output_stream.put(output_tuple)
-
-                t1 = self.input_stream_1.get()
-                t2 = self.input_stream_2.get()
-
-            else:
-                if ts1 < ts2:
-                    t1 = self.input_stream_1.get()
-                else:
-                    t2 = self.input_stream_2.get()
+            # Compare the new Goettingen tuple with every Berlin
+            # tuple currently available in its window.
+            for b_tuple in self.berlin_window:
+                self._try_join(b_tuple, goettingen_tuple)
 
             time.sleep(random.random() * 0.2)
-
-
 class PrintSinkBolt:
     def __init__(self, input_stream, b_str, g_str, gui_instance, on_complete=None):
         self.input_stream = input_stream
